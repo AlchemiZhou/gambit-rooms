@@ -1,0 +1,672 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer"><meta name="theme-color" content="#f6f7f5">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <meta name="description" content="GAMBIT 桌面社交空间 · 杭州测试 · 仅用模拟数据员工包间预约台">
+  <title>GAMBIT 包间预约 · 杭州测试 · 仅用模拟数据</title>
+  <link rel="icon" href="./gambit-mark.png">
+  <link rel="stylesheet" href="./style.css">
+  <script type="module">
+import {$, esc, icon, rooms, roomById, today, shifted, weekOf, weekday, monthDay, minutes, lengthText, roomPill, renderSchedule} from "./calendar.js";
+
+const state = {
+  unlocked: false, owner: false, gate: "loading", week: weekOf(today()), day: today(),
+  view: "grid", bookings: null, error: "", request: 0, selected: null, edit: null,
+  entryId: null, loadedAt: 0, dirty: false, writing: false, pending: null
+};
+const mobile = matchMedia("(max-width: 800px)");
+let toastTimer;
+let detailRequest = 0;
+let gateRequest = 0;
+
+function message(id, text) {
+  const element = $(id);
+  element.textContent = text;
+  element.hidden = !text;
+}
+
+function toast(text) {
+  clearTimeout(toastTimer);
+  message("#toast", text);
+  toastTimer = setTimeout(() => message("#toast", ""), 3600);
+}
+
+function showDialog(id) {
+  const dialog = $(id);
+  if (!dialog.open) dialog.showModal();
+  dialog.scrollTop = 0;
+}
+
+function closeDialog(dialog, force = false) {
+  if (!dialog?.open) return;
+  if (!force && state.writing) return;
+  if (!force && dialog.id === "editor" && state.dirty && !window.confirm("放弃尚未保存的修改？")) return;
+  dialog.close();
+  if (dialog.id === "editor") {
+    state.dirty = false;
+    field("bookingPassword").value = "";
+  }
+  if (dialog.id === "detail") detailRequest++;
+}
+
+const ENDPOINT='https://spb-o0ywhqtq1r41qq7d.supabase.opentrust.net/rest/v1/rpc/gambit_trial_api';
+function publicKey(value) {
+  if (/^sb_publishable_[A-Za-z0-9_-]+$/.test(value)) return true;
+  try { return JSON.parse(atob(value.split('.')[1].replace(/-/g,'+').replace(/_/g,'/'))).role==='anon' && value.split('.').length===3; } catch { return false; }
+}
+const configured=new URLSearchParams(location.hash.slice(1)).get('key') || '';
+let ticket='';
+async function api(path, options={}) {
+  if (!publicKey(configured)) throw Error('请使用负责人生成的测试链接。');
+  const url=new URL(path,'https://local.invalid/');
+  const [resource,id]=url.pathname.slice(1).split('/');
+  const method=options.method||'GET';
+  const action=resource==='bookings' ? ({GET:id?'detail':'list',POST:'create',PUT:'edit',DELETE:'cancel'})[method] : resource;
+  const data={...Object.fromEntries(url.searchParams),...options.body,...(id?{id}:{})};
+  const headers={'Content-Type':'application/json',apikey:configured};
+  if (!configured.startsWith('sb_publishable_')) headers.Authorization='Bearer '+configured;
+  let res;
+  try {res=await fetch(ENDPOINT,{method:'POST',credentials:'omit',cache:'no-store',headers,body:JSON.stringify({action,data,ticket}),signal:AbortSignal.timeout(18000)});}
+  catch {throw Error('连接杭州测试预约台超时，请检查网络和项目访问设置。');}
+  let answer;
+  try { answer=await res.json(); } catch {throw Error('预约接口没有返回有效数据。');}
+  if (!res.ok) throw Error(answer.code==='PGRST202'?'杭州实例尚未完成测试初始化。':'杭州接口拒绝请求，请核对公开密钥和访问设置。');
+  if (answer.error) {
+    const error=new Error(answer.error);error.code=answer.code;
+    if (answer.code==='locked') {ticket='';clearStaff();void staffLogin();}
+    throw error;
+  }
+  if(answer.ticket) ticket=answer.ticket;
+  if(action==='logout') ticket='';
+  return answer;
+}
+if (!publicKey(configured)) {
+  document.body.replaceChildren();
+  const panel=document.createElement('main');panel.className='wrap';
+  panel.innerHTML='<h1>连接杭州测试预约台</h1><p>负责人首次配置。输入 Dashboard 的公开 anon 或 publishable key，生成可以发给测试员工的链接。</p><form><label>项目公开密钥<input name="anon" required autocomplete="off"></label><button class="button primary">生成测试链接</button><p role="alert"></p></form>';
+  document.body.append(panel);
+  panel.querySelector('form').onsubmit=e=>{
+    e.preventDefault();const key=e.target.elements.anon.value.trim();
+    if(!publicKey(key)){panel.querySelector('[role=alert]').textContent='请输入公开 anon 或 publishable key。';return;}
+    location.replace(location.pathname+'#key='+encodeURIComponent(key));location.reload();
+  };
+  throw new Error('等待项目公开密钥');
+}
+
+function gateMode(mode, ownerSignIn = false) {
+  state.gate = mode;
+  const setup = mode === "setup";
+  const waiting = mode === "awaiting" || mode === "offline";
+  $("#gate-form").hidden = waiting;
+  $("#gate-retry").hidden = !waiting;
+  $("#owner-signin").hidden = !ownerSignIn;
+  $("#confirm-field").hidden = !setup;
+  $("#entry-confirm").required = setup;
+  $("#entry-password").minLength = setup ? 8 : 1;
+  $("#entry-password").autocomplete = setup ? "new-password" : "current-password";
+  $("#entry-password").placeholder = setup ? "至少 8 个字符" : "输入门店密码";
+  $("#password-label").textContent = setup ? "新门店密码" : "门店密码";
+  $("#gate-title").textContent = {setup: "设置门店密码", awaiting: "等待开通", offline: "连接预约台"}[mode] || "员工登录";
+  $("#gate-intro").textContent = {
+    setup: "首次使用，请为本店员工设置一个共用密码。",
+    awaiting: "请门店负责人先在管理端设置密码，再用本设备登录。",
+    offline: "暂时无法连接预约库。请检查网络或确认门店服务已启动。"
+  }[mode] || "输入门店密码后即可登记和管理预约。";
+  $("#enter").textContent = setup ? "设置密码并解锁" : "解锁编辑";
+  $("#enter").disabled = mode === "loading";
+}
+
+function clearGateForm() {
+  $("#gate-form").reset();
+  message("#gate-error", "");
+  for (const input of document.querySelectorAll(".password-input input")) input.type = "password";
+  for (const control of document.querySelectorAll(".visibility")) {
+    control.innerHTML = icon("eye");
+    control.setAttribute("aria-label", "显示密码");
+  }
+}
+
+function setAccess(unlocked, owner) {
+  state.unlocked = unlocked;
+  state.owner = owner;
+  $("#staff-login").hidden = unlocked || !$("#gate").hidden;
+  $("#lock").hidden = !unlocked;
+  $("#password-tools").hidden = !(unlocked && owner);
+}
+
+function clearStaff() {
+  state.request++;
+  state.selected = state.edit = state.pending = null;
+  for (const dialog of document.querySelectorAll("dialog[open]")) closeDialog(dialog, true);
+  form.reset();
+  $("#password-form").reset();
+  $("#detail-content").replaceChildren();
+  for (const id of ["#detail-error", "#booking-error", "#change-error"]) message(id, "");
+  setAccess(false, false);
+}
+
+function showBoard() {
+  gateRequest++;
+  state.pending = null;
+  clearGateForm();
+  $("#gate").hidden = true;
+  $("#board").hidden = false;
+  setAccess(state.unlocked, state.owner);
+  render();
+  void refresh();
+}
+
+function resumeAction(intent) {
+  if (intent?.id) void openDetail(intent.id);
+  else if (intent?.room) showEditor(intent.room, intent.day);
+}
+
+function enterBoard(owner) {
+  const intent = state.pending;
+  setAccess(true, owner);
+  showBoard();
+  resumeAction(intent);
+}
+
+async function staffLogin(intent = null, notice = "") {
+  if (state.unlocked) { resumeAction(intent); return; }
+  const request = ++gateRequest;
+  state.request++;
+  state.pending = intent;
+  clearGateForm();
+  $("#board").hidden = $("#staff-login").hidden = true;
+  $("#gate").hidden = false;
+  gateMode("loading");
+  try {
+    const session = await api("session");
+    if (request !== gateRequest) return;
+    if (session.mode === "unlocked") { enterBoard(session.owner); return; }
+    gateMode(session.mode, session.ownerSignIn);
+    message("#gate-error", notice);
+    if (["login", "setup"].includes(session.mode)) $("#entry-password").focus({preventScroll: true});
+  } catch { if (request === gateRequest) gateMode("offline"); }
+}
+
+async function selectDay(day) {
+  const week = weekOf(day);
+  const changed = state.week !== week;
+  state.week = week;
+  state.day = day;
+  if (changed) { state.bookings = null; state.error = ""; }
+  render();
+  await refresh();
+}
+
+async function refresh() {
+  if ($("#board").hidden) return;
+  const request = ++state.request;
+  const from = state.week;
+  try {
+    const result = await api(`bookings?from=${from}&to=${shifted(from, 7)}`);
+    if (request !== state.request) return;
+    if (state.unlocked && !result.canEdit) {
+      clearStaff();
+      toast("编辑登录已结束，可继续查看排期");
+    }
+    setAccess(result.canEdit, result.owner);
+    state.bookings = result.bookings;
+    state.error = "";
+    state.loadedAt = Date.now();
+  } catch (error) {
+    if (request !== state.request) return;
+    state.error = error.message;
+  }
+  render();
+}
+
+function render() { renderSchedule(state, mobile.matches); }
+
+const form = $("#booking-form");
+const field = name => form.elements.namedItem(name);
+
+function newId() {
+  // getRandomValues also works over HTTP on the shop LAN.
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 15) | 64;
+  bytes[8] = (bytes[8] & 63) | 128;
+  const hex = Array.from(bytes, v => v.toString(16).padStart(2, "0")).join("");
+  return [hex.slice(0,8), hex.slice(8,12), hex.slice(12,16), hex.slice(16,20), hex.slice(20)].join("-");
+}
+
+function stamps() {
+  const endDay = field("overnight").checked ? field("endDate").value : field("date").value;
+  return {starts: field("date").value + "T" + field("startTime").value, ends: endDay + "T" + field("endTime").value};
+}
+
+function updateDuration() {
+  const multi = field("overnight").checked;
+  $("#end-date-field").hidden = !multi;
+  field("endDate").required = multi;
+  field("endDate").min = field("date").value;
+  const {starts, ends} = stamps();
+  const span = minutes(starts, ends);
+  $("#duration").textContent = span > 0 ? "共 " + lengthText(span) : "待确认时长";
+  const invalid = Number.isFinite(span) && span <= 0;
+  field("endTime").setCustomValidity(invalid ? "结束时间须晚于开始时间；跨日预约请勾选「跨日结束」。" : "");
+}
+
+async function startBooking(room, day) {
+  if (!state.unlocked) {
+    try {
+      const session = await api("session");
+      if (session.mode === "setup" || session.mode === "awaiting") { await staffLogin({room, day}); return; }
+      if (session.mode === "unlocked") setAccess(true, session.owner);
+    } catch (error) { toast(error.message); return; }
+  }
+  showEditor(room, day);
+}
+
+function showEditor(room, day, booking = null) {
+  if (booking && !state.unlocked) { void staffLogin({id: booking.id}); return; }
+  form.reset();
+  state.edit = booking;
+  state.entryId = booking?.id || newId();
+  $("#editor-title").textContent = booking ? "编辑预约" : "新建预约";
+  $("#create-password-field").hidden = Boolean(booking);
+  field("bookingPassword").disabled = Boolean(booking);
+  field("room").value = room;
+  field("date").value = day;
+  field("startTime").value = booking?.starts.slice(11) || "14:00";
+  field("endTime").value = booking?.ends.slice(11) || "18:00";
+  field("endDate").value = booking?.ends.slice(0, 10) || shifted(day, 1);
+  field("overnight").checked = Boolean(booking && booking.starts.slice(0,10) !== booking.ends.slice(0,10));
+  for (const name of ["title", "people", "contact", "channel", "host", "notes"]) field(name).value = booking?.[name] ?? "";
+  $("#extra").open = Boolean(booking && (booking.contact || booking.channel || booking.host || booking.notes));
+  message("#booking-error", "");
+  updateDuration();
+  state.dirty = false;
+  showDialog("#editor");
+}
+
+function setLength(hours) {
+  const start = stamps().starts;
+  const instant = Date.parse(start + ":00Z");
+  if (!Number.isFinite(instant)) { field("startTime").focus(); return; }
+  const end = new Date(instant + hours * 3600000).toISOString().slice(0, 16);
+  field("endTime").value = end.slice(11);
+  field("endDate").value = end.slice(0,10);
+  field("overnight").checked = end.slice(0,10) !== start.slice(0,10);
+  state.dirty = true;
+  updateDuration();
+}
+
+async function openDetail(id) {
+  const seq = ++detailRequest;
+  state.selected = null;
+  $("#detail-content").innerHTML = '<h2 id="detail-heading">正在读取预约…</h2>';
+  $("#detail-actions").hidden = $("#guest-detail-actions").hidden = $("#delete-check").hidden = true;
+  message("#detail-error", "");
+  showDialog("#detail");
+  try {
+    const {booking: b, canEdit, owner} = await api("bookings/" + encodeURIComponent(id));
+    if (!$("#detail").open || seq !== detailRequest) return;
+    if (state.unlocked && !canEdit) {
+      clearStaff();
+      showDialog("#detail");
+    }
+    setAccess(canEdit, owner);
+    state.selected = b;
+    const date = b.starts.slice(0,10);
+    const endDate = b.ends.slice(0,10);
+    const dateTitle = `${date.slice(0,4)}年${monthDay(date)} ${weekday(date)}`;
+    const ending = endDate === date ? b.ends.slice(11) : `${endDate.slice(0,4) !== date.slice(0,4) ? endDate.slice(0,4) + "年" : ""}${monthDay(endDate)} ${b.ends.slice(11)}`;
+    const more = [["联系人", b.contact], ["电话或微信", b.channel], ["主持人 / GM", b.host], ["备注", b.notes]]
+      .filter(([,v]) => v).map(([key, value]) => `<dt>${key}</dt><dd>${esc(value)}</dd>`).join("");
+    $("#detail-content").innerHTML = `${roomPill(b.room)}<h2 id="detail-heading">${esc(b.title)}</h2>
+      <p class="detail-time">${dateTitle}<br>${b.starts.slice(11)} — ${ending}</p>
+      <div class="facts-strip"><span>${icon("clock")}${lengthText(minutes(b.starts,b.ends))}</span><span>${icon("people")}${b.people} 人</span></div>
+      ${more ? '<dl class="detail-data">' + more + '</dl>' : ''}`;
+    $("#detail-actions").hidden = !canEdit;
+    $("#guest-detail-actions").hidden = canEdit;
+  } catch (error) {
+    if (!$("#detail").open || seq !== detailRequest) return;
+    $("#detail-content").innerHTML = '<h2 id="detail-heading">无法读取预约</h2>';
+    message("#detail-error", error.message);
+    if (error.code === "gone") void refresh();
+  }
+}
+
+async function submitGate(event) {
+  event.preventDefault();
+  const setup = state.gate === "setup";
+  const password = $("#entry-password").value;
+  message("#gate-error", "");
+  if (setup && password !== $("#entry-confirm").value) {
+    message("#gate-error", "两次输入的密码不同，请再确认一次。");
+    $("#entry-confirm").focus();
+    return;
+  }
+  $("#enter").disabled = $("#back-board").disabled = true;
+  try {
+    const result = await api(setup ? "setup" : "login", {method: "POST", body: {password}});
+    enterBoard(result.owner);
+  } catch (error) { message("#gate-error", error.message); }
+  finally { $("#enter").disabled = $("#back-board").disabled = false; }
+}
+
+async function save(event) {
+  event.preventDefault();
+  if (state.writing) return;
+  const draft = Object.fromEntries(new FormData(form));
+  const {starts, ends} = stamps();
+  const payload = {id: state.entryId, room: draft.room, title: draft.title.trim(), people: Number(draft.people),
+    starts, ends, contact: draft.contact, channel: draft.channel, host: draft.host, notes: draft.notes};
+  const editing = state.edit;
+  if (editing) payload.version = editing.version;
+  else payload.password = draft.bookingPassword;
+  if (!payload.title) { message("#booking-error", "请填写活动名称。"); field("title").focus(); return; }
+  message("#booking-error", "");
+  state.writing = $("#save-booking").disabled = true;
+  try {
+    await api(editing ? "bookings/" + editing.id : "bookings", {method: editing ? "PUT" : "POST", body: payload});
+    closeDialog($("#editor"), true);
+    await selectDay(starts.slice(0,10));
+    toast(editing ? "预约已更新" : "预约已保存");
+  } catch (error) {
+    if ($("#editor").open) {
+      message("#booking-error", error.message);
+      if (!editing && /密码/.test(error.message)) {
+        field("bookingPassword").value = "";
+        field("bookingPassword").focus();
+      }
+      $("#booking-error").scrollIntoView({block: "nearest"});
+      if (error.code) void refresh();
+    }
+  } finally { state.writing = $("#save-booking").disabled = false; }
+}
+
+async function removeBooking() {
+  const b = state.selected;
+  if (!b || state.writing) return;
+  state.writing = $("#confirm-delete").disabled = true;
+  message("#detail-error", "");
+  try {
+    await api("bookings/" + b.id, {method: "DELETE", body: {version: b.version}});
+    closeDialog($("#detail"), true);
+    await refresh();
+    toast("预约已取消，时段已释放");
+  } catch (error) {
+    if (state.unlocked) {
+      message("#detail-error", error.message);
+      $("#delete-check").hidden = true;
+      $("#detail-actions").hidden = false;
+      if (error.code) void refresh();
+    }
+  } finally { state.writing = $("#confirm-delete").disabled = false; }
+}
+
+$("#room-choices").innerHTML = rooms.map(r => `<label data-room="${r.id}"><input type="radio" name="room" value="${r.id}" required><span>${r.name}</span></label>`).join("");
+$("#gate-form").addEventListener("submit", submitGate);
+$("#staff-login").addEventListener("click", () => staffLogin());
+$("#back-board").addEventListener("click", () => { showBoard(); $("#staff-login").focus(); });
+$("#gate-retry").addEventListener("click", () => staffLogin(state.pending));
+$("#booking-form").addEventListener("submit", save);
+form.addEventListener("input", event => {
+  state.dirty = true;
+  if (event.target === field("date") && !field("overnight").checked && field("date").value)
+    field("endDate").value = shifted(field("date").value, 1);
+  if (event.target === field("overnight") && field("overnight").checked && field("endDate").value <= field("date").value && field("date").value)
+    field("endDate").value = shifted(field("date").value, 1);
+  updateDuration();
+});
+$("#new-booking").addEventListener("click", () => startBooking("trpg", state.day));
+$("#this-week").addEventListener("click", () => selectDay(today()));
+$("#next-week").addEventListener("click", () => selectDay(shifted(weekOf(today()), 7)));
+$("#prev").addEventListener("click", () => selectDay(shifted(state.day, -7)));
+$("#next").addEventListener("click", () => selectDay(shifted(state.day, 7)));
+$("#view-grid").addEventListener("click", () => { state.view = "grid"; render(); });
+$("#view-list").addEventListener("click", () => { state.view = "list"; render(); });
+$("#jump").addEventListener("click", () => { $("#jump-date").value = state.day; showDialog("#date-dialog"); });
+$("#date-form").addEventListener("submit", event => {
+  event.preventDefault();
+  closeDialog($("#date-dialog"));
+  void selectDay($("#jump-date").value);
+});
+$("#edit-booking").addEventListener("click", () => {
+  const b = state.selected;
+  if (!b) return;
+  closeDialog($("#detail"));
+  showEditor(b.room, b.starts.slice(0, 10), b);
+});
+$("#detail-login").addEventListener("click", () => {
+  const id = state.selected?.id;
+  closeDialog($("#detail"));
+  if (id) void staffLogin({id});
+});
+$("#cancel-booking").addEventListener("click", () => {
+  $("#detail-actions").hidden = true;
+  $("#delete-check").hidden = false;
+  $("#keep-booking").focus();
+});
+$("#keep-booking").addEventListener("click", () => {
+  $("#detail-actions").hidden = false;
+  $("#delete-check").hidden = true;
+  $("#cancel-booking").focus();
+});
+$("#confirm-delete").addEventListener("click", removeBooking);
+$("#lock").addEventListener("click", async () => {
+  $("#lock").disabled = true;
+  try {
+    await api("logout", {method: "POST", body: {}});
+    clearStaff();
+    showBoard();
+    toast("已退出编辑，可继续查看排期");
+  }
+  catch (error) { toast(error.message); }
+  finally { $("#lock").disabled = false; }
+});
+$("#password-tools").addEventListener("click", () => {
+  $("#password-form").reset();
+  message("#change-error", "");
+  showDialog("#password-dialog");
+});
+$("#password-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const f = event.currentTarget, data = Object.fromEntries(new FormData(f));
+  if (data.password !== data.confirm) { message("#change-error", "两次输入的新密码不同。"); return; }
+  const submit = f.querySelector("button[type=submit]");
+  state.writing = submit.disabled = true;
+  message("#change-error", "");
+  try {
+    await api("password", {method: "PUT", body: {current: data.current, password: data.password}});
+    f.reset();
+    closeDialog($("#password-dialog"), true);
+    toast("门店密码已更新");
+  } catch (error) { if (state.unlocked) message("#change-error", error.message); }
+  finally { state.writing = submit.disabled = false; }
+});
+
+document.addEventListener("click", event => {
+  const b = event.target.closest("button");
+  if (!b || b.disabled) return;
+  if (b.hasAttribute("data-close")) return closeDialog(b.closest("dialog"));
+  if (b.classList.contains("visibility")) {
+    const input = document.getElementById(b.dataset.for);
+    const reveal = input.type === "password";
+    input.type = reveal ? "text" : "password";
+    b.setAttribute("aria-label", reveal ? "隐藏密码" : "显示密码");
+    b.innerHTML = icon(reveal ? "eyeoff" : "eye");
+    return;
+  }
+  if (b.dataset.id) void openDetail(b.dataset.id);
+  else if (b.dataset.add) void startBooking(b.dataset.add, b.dataset.date);
+  else if (b.dataset.day) { state.day = b.dataset.day; render(); }
+  else if (b.dataset.length) setLength(Number(b.dataset.length));
+  else if (b.hasAttribute("data-retry")) void refresh();
+});
+for (const d of document.querySelectorAll("dialog")) d.addEventListener("cancel", event => {
+  event.preventDefault();
+  closeDialog(d);
+});
+mobile.addEventListener("change", render);
+function refreshIfVisible() {
+  if (!document.hidden && Date.now() - state.loadedAt > 1500) void refresh();
+}
+document.addEventListener("visibilitychange", refreshIfVisible);
+window.addEventListener("focus", refreshIfVisible);
+window.addEventListener("pageshow", event => { if (event.persisted) { clearStaff(); showBoard(); } });
+setInterval(refreshIfVisible, 30000);
+const entry = new URL(location.href);
+if (entry.searchParams.get("new") === "1") {
+  const room = roomById(entry.searchParams.get("room"))?.id || "trpg";
+  const raw = entry.searchParams.get("day") || "";
+  const stamp = new Date(raw + "T00:00:00Z");
+  const day = /^[1-9]\d{3}-\d{2}-\d{2}$/.test(raw) && raw < "9999" && Number.isFinite(+stamp) && stamp.toISOString().slice(0,10) === raw ? raw : today();
+  state.day = day;
+  state.week = weekOf(day);
+  for (const key of ["new", "room", "day"]) entry.searchParams.delete(key);
+  history.replaceState(null, "", entry);
+  showBoard();
+  void startBooking(room, day);
+} else if (entry.searchParams.get("staff") === "1") {
+  const id = entry.searchParams.get("booking") || "";
+  entry.searchParams.delete("staff");
+  entry.searchParams.delete("booking");
+  history.replaceState(null, "", entry);
+  void staffLogin(/^[0-9a-f-]{36}$/i.test(id) ? {id} : null);
+} else {
+  showBoard();
+}
+
+</script>
+</head>
+<body>
+<svg class="icon-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <symbol id="i-pin" viewBox="0 0 24 24"><path d="M20 10c0 6-8 12-8 12S4 16 4 10a8 8 0 1 1 16 0Z"/><circle cx="12" cy="10" r="2.5"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4.5" y="10" width="15" height="11" rx="2"/><path d="M8 10V7a4 4 0 1 1 8 0v3m-4 5v2"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="8" r="5"/><path d="m11.5 11.5 8.5 8.5m-4-4 3-3m-1 5 3-3"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-eyeoff" viewBox="0 0 24 24"><path d="M3 3l18 18M10 5.2c6-1.1 10 4.1 12 6.8a20 20 0 0 1-3 3.6M6 6.6A20 20 0 0 0 2 12s3.4 7 10 7a11 11 0 0 0 4.1-.8"/></symbol>
+  <symbol id="i-die" viewBox="0 0 24 24"><path d="m12 2 9 5v10l-9 5-9-5V7Zm0 0-4 7h8Zm-9 5 5 2-3 9m16-11-5 2 3 9M8 9l4 10 4-10m-11 9 7 1 7-1m-7 1v3"/></symbol>
+  <symbol id="i-large" viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="10" rx="2"/><path d="M6 4h3m6 0h3M6 20h3m6 0h3"/></symbol>
+  <symbol id="i-room" viewBox="0 0 24 24"><path d="M5 21V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16M3 21h18m-6-9v2"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 3v4m10-4v4M3 10h18m-14 4h3m4 0h3"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18m-11 0v10"/></symbol>
+  <symbol id="i-list" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.5M3 12h.5M3 18h.5"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/></symbol>
+  <symbol id="i-people" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><path d="M3 20v-2a6 6 0 0 1 12 0v2m1-15a3 3 0 0 1 0 6m2 3a5 5 0 0 1 3 4v2"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="m15 5 4 4M4 20l4-1 12-12a2.8 2.8 0 0 0-4-4L4 15Z"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m4 12 5 5L20 6"/></symbol>
+</svg>
+<header class="topbar">
+  <div class="mast wrap">
+    <div class="brand" aria-label="GAMBIT 桌面社交空间"><img src="./gambit-mark.png" width="48" height="24" alt=""><div><b>GAMBIT</b><span>桌面社交空间</span></div></div>
+    <div class="mast-tools">
+      <span class="location"><svg class="ico"><use href="#i-pin"/></svg>杭州测试 · 仅用模拟数据</span>
+      <button id="staff-login" class="plain lock"><svg class="ico"><use href="#i-key"/></svg>员工登录</button>
+      <button id="password-tools" class="icon-button" title="修改门店密码" aria-label="修改门店密码" hidden><svg class="ico"><use href="#i-key"/></svg></button>
+      <button id="lock" class="plain lock" hidden><svg class="ico"><use href="#i-lock"/></svg>退出编辑</button>
+    </div>
+  </div>
+</header>
+<noscript><p class="wrap">请启用 JavaScript 后使用预约台。</p></noscript>
+<main id="gate" class="gate-main wrap" hidden>
+  <section class="gate-card" aria-labelledby="gate-title">
+    <div class="hero-photo">
+      
+      
+      <div class="photo-caption"><span class="eyebrow"><i></i>ROOM RESERVATIONS</span><h1>包间预约</h1></div>
+      <div class="checker" aria-hidden="true"></div>
+    </div>
+    <div class="gate-entry">
+      <div class="key-icon"><svg class="ico"><use href="#i-key"/></svg></div>
+      <h2 id="gate-title">员工登录</h2>
+      <p id="gate-intro" class="intro">输入门店密码后即可登记和管理预约。</p>
+      <form id="gate-form">
+        <label for="entry-password" id="password-label">门店密码</label>
+        <div class="password-input"><input id="entry-password" type="password" maxlength="128" autocomplete="current-password" placeholder="输入门店密码" required><button type="button" class="icon-button visibility" data-for="entry-password" aria-label="显示密码"><svg class="ico"><use href="#i-eye"/></svg></button></div>
+        <div id="confirm-field" hidden><label for="entry-confirm">确认密码</label><div class="password-input"><input id="entry-confirm" type="password" maxlength="128" autocomplete="new-password" placeholder="再次输入门店密码"><button type="button" class="icon-button visibility" data-for="entry-confirm" aria-label="显示密码"><svg class="ico"><use href="#i-eye"/></svg></button></div></div>
+        <p id="gate-error" class="error" role="alert" hidden></p>
+        <button type="submit" id="enter" class="button primary full" disabled>解锁编辑</button>
+      </form>
+      <button id="gate-retry" type="button" class="button" hidden>重新连接</button>
+      <div class="gate-links"><button id="back-board" type="button" class="plain">返回排期</button><a id="owner-signin" href="#" target="_top" hidden>负责人账号登录</a></div>
+    </div>
+  </section>
+  <section class="room-index" aria-label="门店四个包间">
+    <h2>门店包间</h2>
+    <div data-room="trpg"><span class="room-icon"><svg class="ico"><use href="#i-die"/></svg></span>跑团包间</div>
+    <div data-room="large"><span class="room-icon"><svg class="ico"><use href="#i-large"/></svg></span>大包间</div>
+    <div data-room="small1"><span class="room-icon"><svg class="ico"><use href="#i-room"/></svg></span>小包间1</div>
+    <div data-room="small2"><span class="room-icon"><svg class="ico"><use href="#i-room"/></svg></span>小包间2</div>
+  </section>
+</main>
+<main id="board" class="board wrap">
+  <div class="page-heading">
+    <div><div class="eyebrow"><i></i>ROOM RESERVATIONS</div><h1>包间预约</h1><p id="stats" class="summary" aria-live="polite"></p></div>
+    <button id="new-booking" class="button primary"><svg class="ico"><use href="#i-plus"/></svg>新建预约</button>
+  </div>
+  <section class="calendar-panel" aria-labelledby="week-range">
+    <div class="calendar-toolbar">
+      <div class="week-control"><div class="week-tabs" aria-label="快捷选周"><button id="this-week">本周</button><button id="next-week">下周</button></div>
+      <button class="plain jump" id="jump"><svg class="ico"><use href="#i-calendar"/></svg>跳转日期</button></div>
+      <div class="view-tabs" aria-label="查看方式"><button id="view-grid"><svg class="ico"><use href="#i-grid"/></svg>排期</button><button id="view-list"><svg class="ico"><use href="#i-list"/></svg>周清单</button></div>
+    </div>
+    <div class="week-line"><h2 id="week-range"></h2><div class="pager"><button id="prev" aria-label="上一周">上一周</button><span aria-hidden="true"></span><button id="next" aria-label="下一周">下一周</button></div></div>
+    <div id="calendar-feedback" class="notice" role="status" hidden></div>
+    <div id="schedule"></div>
+  </section>
+</main>
+<dialog id="date-dialog" class="dialog compact" aria-labelledby="date-title">
+  <div class="dialog-head"><h2 id="date-title">跳转日期</h2><button type="button" class="icon-button" data-close aria-label="关闭"><svg class="ico"><use href="#i-x"/></svg></button></div>
+  <form id="date-form"><div class="dialog-body"><label for="jump-date">查看哪一天</label><input type="date" id="jump-date" min="1000-01-01" max="9998-12-31" required></div>
+  <div class="dialog-foot"><button type="button" class="button" data-close>返回</button><button type="submit" class="button primary">查看排期</button></div></form>
+</dialog>
+<dialog id="editor" class="dialog" aria-labelledby="editor-title">
+  <div class="dialog-head"><h2 id="editor-title">新建预约</h2><button type="button" class="icon-button" data-close aria-label="关闭"><svg class="ico"><use href="#i-x"/></svg></button></div>
+  <form id="booking-form">
+    <div class="dialog-body form-grid">
+      <fieldset class="wide"><legend>包间</legend><div id="room-choices" class="room-choices"></div></fieldset>
+      <label class="wide">活动名称 <span class="field-note">持链接者可见</span><input name="title" required maxlength="80" placeholder="例如：匕首之心新手团"></label>
+      <label>预约日期<input type="date" name="date" required min="1000-01-01" max="9998-12-31"></label>
+      <label>人数<input type="number" name="people" min="1" max="999" step="1" inputmode="numeric" placeholder="填写人数" required></label>
+      <label>开始时间<input type="time" name="startTime" required></label>
+      <label>结束时间<input type="time" name="endTime" required></label>
+      <div class="duration-row wide"><div class="duration"><svg class="ico"><use href="#i-clock"/></svg><output id="duration"></output></div><label class="inline-check"><input type="checkbox" name="overnight">跨日结束</label></div>
+      <label id="end-date-field" class="wide" hidden>结束日期<input type="date" name="endDate" max="9999-12-31"></label>
+      <div class="quick-lengths wide" aria-label="快捷填写时长"><span>快捷时长</span><button type="button" data-length="2">2 小时</button><button type="button" data-length="3">3 小时</button><button type="button" data-length="4">4 小时</button><button type="button" data-length="5">5 小时</button></div>
+      <details class="extra wide" id="extra"><summary>补充信息 <span>选填 · 仅员工可见</span><svg class="ico"><use href="#i-down"/></svg></summary>
+        <div class="form-grid">
+          <label>联系人<input name="contact" maxlength="80" autocomplete="off"></label>
+          <label>电话或微信<input name="channel" maxlength="120" autocomplete="off"></label>
+          <label class="wide">主持人 / GM<input name="host" maxlength="80"></label>
+          <label class="wide">备注<textarea name="notes" maxlength="2000" rows="3" placeholder="例如：提前摆台、自带游戏、到店时间变更"></textarea></label>
+        </div>
+      </details>
+      <label id="create-password-field" class="wide">门店密码 <span class="field-note">每次新建都需输入</span><input type="password" name="bookingPassword" maxlength="128" autocomplete="off" placeholder="输入门店密码后保存预约" required></label>
+      <p id="booking-error" class="wide error" role="alert" hidden></p>
+    </div>
+    <div class="dialog-foot"><button type="button" class="button" data-close>返回</button><button type="submit" id="save-booking" class="button primary">保存预约</button></div>
+  </form>
+</dialog>
+<dialog id="detail" class="dialog detail" aria-labelledby="detail-heading">
+  <div class="dialog-head"><span class="dialog-section">预约详情</span><button type="button" class="icon-button" data-close aria-label="关闭"><svg class="ico"><use href="#i-x"/></svg></button></div>
+  <div id="detail-content" class="dialog-body"></div>
+  <div id="delete-check" class="delete-check" hidden><b>确定取消这场预约？</b><p>确认后，这个时段将重新开放预约。</p><div><button type="button" class="button" id="keep-booking">保留预约</button><button type="button" class="button destructive" id="confirm-delete">确认取消</button></div></div>
+  <p id="detail-error" class="error inset" role="alert" hidden></p>
+  <div class="dialog-foot" id="detail-actions" hidden><button type="button" class="text-danger" id="cancel-booking">取消预约</button><button type="button" class="button primary" id="edit-booking"><svg class="ico"><use href="#i-edit"/></svg>编辑预约</button></div>
+  <div class="dialog-foot" id="guest-detail-actions" hidden><button type="button" class="button" data-close>返回排期</button><button type="button" class="button primary" id="detail-login"><svg class="ico"><use href="#i-key"/></svg>员工登录</button></div>
+</dialog>
+<dialog id="password-dialog" class="dialog compact" aria-labelledby="password-title">
+  <div class="dialog-head"><h2 id="password-title">修改门店密码</h2><button class="icon-button" data-close aria-label="关闭"><svg class="ico"><use href="#i-x"/></svg></button></div>
+  <form id="password-form"><div class="dialog-body form-stack">
+    <label>当前密码<input name="current" type="password" autocomplete="current-password" maxlength="128" required></label>
+    <label>新密码<input name="password" type="password" autocomplete="new-password" minlength="8" maxlength="128" required placeholder="至少 8 个字符"></label>
+    <label>确认新密码<input name="confirm" type="password" autocomplete="new-password" maxlength="128" required></label>
+    <p class="muted">保存后，其他设备需使用新密码登录。</p><p id="change-error" class="error" role="alert" hidden></p>
+  </div><div class="dialog-foot"><button type="button" class="button" data-close>返回</button><button type="submit" class="button primary">保存新密码</button></div></form>
+</dialog>
+<div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>
