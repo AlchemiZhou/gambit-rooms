@@ -13,7 +13,7 @@
 import {$, esc, icon, rooms, roomById, today, shifted, weekOf, weekday, monthDay, minutes, lengthText, roomPill, renderSchedule} from "./calendar.js";
 
 const state = {
-  unlocked: false, owner: false, gate: "loading", week: weekOf(today()), day: today(),
+  unlocked: false, owner: false, sessionCreate: false, gate: "loading", week: weekOf(today()), day: today(),
   view: "grid", bookings: null, error: "", request: 0, selected: null, edit: null,
   entryId: null, loadedAt: 0, dirty: false, writing: false, pending: null
 };
@@ -79,6 +79,7 @@ async function api(path, options={}) {
     if (answer.code==='locked') {ticket='';clearStaff();void staffLogin();}
     throw error;
   }
+  if(typeof answer.sessionCreate==='boolean') state.sessionCreate=answer.sessionCreate;
   if(answer.ticket) ticket=answer.ticket;
   if(action==='logout') ticket='';
   return answer;
@@ -270,8 +271,9 @@ function showEditor(room, day, booking = null) {
   state.edit = booking;
   state.entryId = booking?.id || newId();
   $("#editor-title").textContent = booking ? "编辑预约" : "新建预约";
-  $("#create-password-field").hidden = Boolean(booking);
-  field("bookingPassword").disabled = Boolean(booking);
+  const needPassword = !booking && !(state.unlocked && state.sessionCreate);
+  $("#create-password-field").hidden = !needPassword;
+  field("bookingPassword").disabled = !needPassword;
   field("room").value = room;
   field("date").value = day;
   field("startTime").value = booking?.starts.slice(11) || "14:00";
@@ -361,7 +363,7 @@ async function save(event) {
     starts, ends, contact: draft.contact, channel: draft.channel, host: draft.host, notes: draft.notes};
   const editing = state.edit;
   if (editing) payload.version = editing.version;
-  else payload.password = draft.bookingPassword;
+  else if (!field("bookingPassword").disabled) payload.password = draft.bookingPassword;
   if (!payload.title) { message("#booking-error", "请填写活动名称。"); field("title").focus(); return; }
   message("#booking-error", "");
   state.writing = $("#save-booking").disabled = true;
