@@ -1,0 +1,28 @@
+name: Publish public booking calendar
+on:
+  push:
+    branches: [main]
+    paths: [build-calendar.mjs, viewer.js, index.html, calendar.js, style.css, gambit-mark.png]
+  workflow_dispatch:
+  schedule:
+    - cron: '4,19,34,49 * * * *'
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: gambit-public-calendar
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: github-pages
+    steps:
+      - uses: actions/checkout@v4
+      - run: node build-calendar.mjs
+        env:
+          BOOKING_SOURCE: ${{ vars.BOOKING_SOURCE }}
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - uses: actions/deploy-pages@v4
