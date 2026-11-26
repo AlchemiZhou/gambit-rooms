@@ -20,5 +20,5 @@ for(let cursor=from;cursor<to;){
   cursor=end;
 }
 await mkdir("_site",{recursive:true});
-for(const file of ["index.html","calendar.js","viewer.js","style.css","gambit-mark.png"])await copyFile(file,"_site/"+file);
+for(const file of ["index.html","calendar.js","viewer.js","style.css","gambit-mark.png","staff-trial.html"])await copyFile(file,"_site/"+file);
 await writeFile("_site/schedule.json",JSON.stringify({updatedAt:new Date().toISOString(),from,to,bookings:[...records.values()].sort((a,b)=>a.starts.localeCompare(b.starts)||a.id.localeCompare(b.id))}));
