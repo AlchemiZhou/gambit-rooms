@@ -11,22 +11,22 @@ function render() { renderSchedule(state, mobile.matches); }
 
 async function refresh() {
   const request = ++generation;
-  const url = new URL("api/public/bookings", service);
-  url.searchParams.set("from", state.week);
-  url.searchParams.set("to", shifted(state.week, 7));
+  const url = new URL("./schedule.json", location.href);
   try {
     const response = await fetch(url, {credentials:"omit", cache:"no-store", referrerPolicy:"no-referrer"});
     if (!response.ok) throw new Error();
     const data = await response.json();
     if (!Array.isArray(data.bookings)) throw new Error();
     if (request !== generation) return;
-    state.bookings = data.bookings;
+    if (state.week < data.from || shifted(state.week,7) > data.to) { state.bookings=null; throw Error("所选周超出已发布范围。"); }
+    state.bookings = data.bookings.filter(b=>b.starts < shifted(state.week,7)+"T00:00" && b.ends > state.week+"T00:00");
+    $("#published-time").textContent = "排期更新于 " + new Intl.DateTimeFormat("zh-CN",{timeZone:"Asia/Shanghai",month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"}).format(new Date(data.updatedAt));
     state.error = "";
     refreshed = Date.now();
     if ($("#detail").open) showDetail(selected);
-  } catch {
+  } catch (error) {
     if (request !== generation) return;
-    state.error = "暂时无法读取实时排期，请检查网络后重试。";
+    state.error = error.message === "所选周超出已发布范围。" ? error.message : "暂时无法读取 GitHub 上的排期，请稍后重试。";
   }
   render();
 }

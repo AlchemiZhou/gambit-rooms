@@ -2,7 +2,6 @@ name: Publish public booking calendar
 on:
   push:
     branches: [main]
-    paths: [build-calendar.mjs, viewer.js, index.html, calendar.js, style.css, gambit-mark.png]
   workflow_dispatch:
   schedule:
     - cron: '4,19,34,49 * * * *'

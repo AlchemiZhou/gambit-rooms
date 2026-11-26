@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="zh-CN"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src https://gambit-futian-room-bookings.major-petal-4125.chatgpt.site; form-action 'none'; base-uri 'none'; object-src 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'none'; base-uri 'none'; object-src 'none'">
 <meta name="referrer" content="no-referrer"><meta name="robots" content="noindex, nofollow, noarchive">
 <meta name="theme-color" content="#f6f7f5"><meta name="booking-service" content="https://gambit-futian-room-bookings.major-petal-4125.chatgpt.site/">
 <title>GAMBIT 包间排期 · 福田车公庙店</title><link rel="icon" href="./gambit-mark.png"><link rel="stylesheet" href="./style.css">
@@ -44,7 +44,7 @@
     </div>
     <div class="week-line"><h2 id="week-range"></h2><div class="pager"><button id="prev" aria-label="上一周">上一周</button><span aria-hidden="true"></span><button id="next" aria-label="下一周">下一周</button></div></div>
     <div id="calendar-feedback" class="notice" role="status" hidden></div>
-    <div id="schedule"></div>
+    <div id="schedule"></div><p class="summary" id="published-time" aria-live="polite"></p>
   </section>
 </main>
 <dialog id="date-dialog" class="dialog compact" aria-labelledby="date-title">
